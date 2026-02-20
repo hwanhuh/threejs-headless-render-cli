@@ -24,7 +24,9 @@ program
   .option('--w <number>', 'width in pixels', (v) => parseInt(v, 10), 1024)
   .option('--h <number>', 'height in pixels', (v) => parseInt(v, 10), 1024)
   .option('--bg <transparent|white>', 'background', 'transparent')
-  .option('--exposure <number>', 'tone mapping exposure', (v) => parseFloat(v), 1.2)
+  .option('--exposure <number>', 'tone mapping exposure', (v) => parseFloat(v), 1.35)
+  .option('--env <path>', 'environment map (.hdr or .exr) for lighting only')
+  .option('--env-intensity <number>', 'environment intensity', (v) => parseFloat(v), 1.0)
   .option('--three <local|cdn>', 'three.js source', 'local')
   .option('--fov <number>', 'base camera fov', (v) => parseFloat(v), 40)
   .option('--fov-jitter <number>', 'fov random variation (+/-)', (v) => parseFloat(v), 4)
@@ -59,6 +61,7 @@ if (!Number.isFinite(opts.h) || opts.h <= 0) fail('Height must be a positive num
 if (!['transparent', 'white'].includes(opts.bg)) fail('bg must be transparent or white');
 if (!['local', 'cdn'].includes(opts.three)) fail('three must be local or cdn');
 if (!Number.isFinite(opts.exposure) || opts.exposure <= 0) fail('exposure must be positive');
+if (!Number.isFinite(opts.envIntensity) || opts.envIntensity <= 0) fail('env-intensity must be positive');
 if (!Number.isFinite(opts.fov) || opts.fov <= 1 || opts.fov >= 120) fail('fov must be between 1 and 120');
 if (!Number.isFinite(opts.fovJitter) || opts.fovJitter < 0) fail('fov-jitter must be >= 0');
 if (!Number.isFinite(opts.distance) || opts.distance <= 0) fail('distance must be positive');
@@ -74,6 +77,20 @@ const outRoot = path.resolve(process.cwd(), opts.outDir);
 
 const htmlTemplate = fs.readFileSync(path.join(projectRoot, 'src', 'render-page.html'), 'utf8');
 
+let envPath = null;
+let envUrl = '';
+let envType = '';
+if (opts.env) {
+  envPath = path.resolve(process.cwd(), opts.env);
+  if (!fs.existsSync(envPath)) fail(`Env map not found: ${opts.env}`);
+  const ext = path.extname(envPath).toLowerCase();
+  if (!['.hdr', '.exr'].includes(ext)) {
+    fail('env must be a .hdr or .exr file');
+  }
+  envType = ext.slice(1);
+  envUrl = `/env.${envType}`;
+}
+
 let threeVersion = '0.161.0';
 try {
   const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
@@ -88,12 +105,22 @@ const threeUrl = opts.three === 'cdn'
 const loaderUrl = opts.three === 'cdn'
   ? `https://unpkg.com/three@${threeVersion}/examples/jsm/loaders/GLTFLoader.js`
   : '/examples/jsm/loaders/GLTFLoader.js';
+const envLoaderUrl = (() => {
+  if (!envType) return '';
+  const filename = envType === 'hdr' ? 'RGBELoader.js' : 'EXRLoader.js';
+  return opts.three === 'cdn'
+    ? `https://unpkg.com/three@${threeVersion}/examples/jsm/loaders/${filename}`
+    : `/examples/jsm/loaders/${filename}`;
+})();
 
 const renderOpts = {
   width: opts.w,
   height: opts.h,
   bg: opts.bg,
   exposure: opts.exposure,
+  envUrl,
+  envType,
+  envIntensity: opts.envIntensity,
   antialias: !!opts.antialias,
   warmupFrames: opts.warmupFrames,
   viewFrames: opts.viewFrames,
@@ -103,7 +130,10 @@ const renderOpts = {
 const html = htmlTemplate
   .replace('__RENDER_OPTS__', JSON.stringify(renderOpts))
   .replace('__THREE_URL__', threeUrl)
-  .replace('__LOADER_URL__', loaderUrl);
+  .replace('__LOADER_URL__', loaderUrl)
+  .replace('__ENV_LOADER_URL__', envLoaderUrl || '')
+  .replace('__ENV_URL__', envUrl || '')
+  .replace('__ENV_TYPE__', envType || '');
 
 const localThreePath = path.join(projectRoot, 'node_modules', 'three', 'build', 'three.module.js');
 const localExamplesRoot = path.join(projectRoot, 'node_modules', 'three', 'examples', 'jsm');
@@ -245,6 +275,14 @@ function startLocalServer() {
         }
         res.writeHead(200, { 'Content-Type': 'model/gltf-binary' });
         res.end(currentModelBuffer);
+        return;
+      }
+      if (envPath && pathname === envUrl) {
+        const contentType = envType === 'hdr'
+          ? 'application/octet-stream'
+          : 'application/octet-stream';
+        res.writeHead(200, { 'Content-Type': contentType });
+        res.end(fs.readFileSync(envPath));
         return;
       }
 

@@ -16,6 +16,7 @@
     const opts = JSON.parse(document.getElementById('render-opts').textContent);
     const THREE_URL = '__THREE_URL__';
     const LOADER_URL = '__LOADER_URL__';
+    const ENV_LOADER_URL = '__ENV_LOADER_URL__';
 
     async function main() {
       const THREE = await import(THREE_URL);
@@ -62,16 +63,25 @@
       camera.position.set(0, 0, 4);
       camera.lookAt(0, 0, 0);
 
-      const ambient = new THREE.AmbientLight(0xffffff, 0.4);
-      scene.add(ambient);
-
+      const ambient = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
       const key = new THREE.DirectionalLight(0xffffff, 1.2);
+      const fill = new THREE.DirectionalLight(0xffffff, 1.0);
+      const rim = new THREE.DirectionalLight(0xffffff, 1.0);
+      const lowFill = new THREE.PointLight(0xffffff, 0.25, 12, 2);
+      const sideFill = new THREE.PointLight(0xffffff, 0.2, 12, 2);
       key.position.set(3, 5, 4);
-      scene.add(key);
-
-      const fill = new THREE.DirectionalLight(0x8888ff, 0.3);
       fill.position.set(-3, 2, -2);
-      scene.add(fill);
+      rim.position.set(0, 3, -5);
+      lowFill.position.set(0, -2, 0);
+      sideFill.position.set(-4, 1, 0);
+      if (!opts.envUrl) {
+        scene.add(ambient);
+        scene.add(key);
+        scene.add(fill);
+        scene.add(rim);
+        scene.add(lowFill);
+        scene.add(sideFill);
+      }
 
       function disposeObject(obj) {
         obj.traverse((child) => {
@@ -101,7 +111,7 @@
         box.getSize(size);
         const maxDim = Math.max(size.x, size.y, size.z);
         const safeMaxDim = Number.isFinite(maxDim) && maxDim > 0 ? maxDim : 1;
-        const scale = 2.0 / safeMaxDim;
+        const scale = 2.2 / safeMaxDim;
         model.scale.setScalar(scale);
         const center = new THREE.Vector3();
         box.getCenter(center);
@@ -110,6 +120,27 @@
 
       const loader = new GLTFLoader();
       let currentModel = null;
+
+      if (opts.envUrl) {
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        const envLoader = await import(ENV_LOADER_URL);
+        let tex = null;
+        if (opts.envType === 'hdr') {
+          const rgbe = new envLoader.RGBELoader();
+          rgbe.setDataType(THREE.HalfFloatType);
+          tex = await rgbe.loadAsync(opts.envUrl);
+        } else if (opts.envType === 'exr') {
+          const exr = new envLoader.EXRLoader();
+          tex = await exr.loadAsync(opts.envUrl);
+        }
+        if (tex) {
+          const envMap = pmrem.fromEquirectangular(tex).texture;
+          scene.environment = envMap;
+          scene.environmentIntensity = Number.isFinite(opts.envIntensity) ? opts.envIntensity : 1.0;
+          tex.dispose();
+          pmrem.dispose();
+        }
+      }
 
       async function loadModel(url) {
         if (currentModel) {

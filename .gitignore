@@ -10,7 +10,6 @@ node_modules/
 .local/
 .gitconfig
 
-assets
 *.png
 
 render_test

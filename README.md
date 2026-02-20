@@ -58,7 +58,9 @@ Options:
 - `--w <number>` default `1024`
 - `--h <number>` default `1024`
 - `--bg <transparent|white>` default `transparent`
-- `--exposure <number>` default `1.2`
+- `--exposure <number>` default `1.35`
+- `--env <path>` optional environment map (.hdr or .exr) for lighting only
+- `--env-intensity <number>` default `1`
 - `--three <local|cdn>` default `local`
 - `--fov <number>` base camera FOV, default `40`
 - `--fov-jitter <number>` FOV jitter (+/-), default `4`
@@ -82,6 +84,7 @@ node bin/render-glb.js --in ./model.glb --out-dir ./renders --views 24
 node bin/render-glb.js --dir ./dataset/models --out-dir ./renders --views 24 --seed 42
 node bin/render-glb.js --dir /data/HHHH/texverse/extracted --out-dir ./renders --views 24 --workers 8 --gpu-mode gpu --profile --seed 42
 node bin/render-glb.js --in ./model.glb --bg white --three cdn --fov 40 --fov-jitter 3
+node bin/render-glb.js --in ./model.glb --env ./studio.hdr --env-intensity 1.0
 ```
 
 H100 server example (all texverse parts under one root):
