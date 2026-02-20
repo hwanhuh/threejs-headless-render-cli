@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
@@ -384,12 +385,42 @@ async function launchBrowser() {
       return env;
     }
 
+    function findNvidiaEglLib() {
+      const candidates = [
+        '/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.0',
+        '/usr/lib/libEGL_nvidia.so.0',
+        '/lib/x86_64-linux-gnu/libEGL_nvidia.so.0',
+        '/usr/local/lib/libEGL_nvidia.so.0'
+      ];
+      for (const p of candidates) {
+        if (fs.existsSync(p)) {
+          return p;
+        }
+      }
+      return null;
+    }
+
     const nvidiaEglVendor = '/usr/share/glvnd/egl_vendor.d/10_nvidia.json';
     const nvidiaVkIcd = '/usr/share/vulkan/icd.d/nvidia_icd.json';
     const nvidiaVkIcdAlt = '/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json';
 
-    if (!env.__EGL_VENDOR_LIBRARY_FILENAMES && fs.existsSync(nvidiaEglVendor)) {
-      env.__EGL_VENDOR_LIBRARY_FILENAMES = nvidiaEglVendor;
+    if (!env.__EGL_VENDOR_LIBRARY_FILENAMES) {
+      if (fs.existsSync(nvidiaEglVendor)) {
+        env.__EGL_VENDOR_LIBRARY_FILENAMES = nvidiaEglVendor;
+      } else {
+        const libEgl = findNvidiaEglLib();
+        if (libEgl) {
+          const tmpVendor = path.join(os.tmpdir(), `egl_vendor_nvidia_${process.pid}.json`);
+          const json = JSON.stringify({
+            file_format_version: '1.0.0',
+            ICD: { library_path: libEgl }
+          });
+          try {
+            fs.writeFileSync(tmpVendor, json, 'utf8');
+            env.__EGL_VENDOR_LIBRARY_FILENAMES = tmpVendor;
+          } catch {}
+        }
+      }
     }
     if (!env.VK_ICD_FILENAMES) {
       if (fs.existsSync(nvidiaVkIcd)) {
@@ -397,6 +428,9 @@ async function launchBrowser() {
       } else if (fs.existsSync(nvidiaVkIcdAlt)) {
         env.VK_ICD_FILENAMES = nvidiaVkIcdAlt;
       }
+    }
+    if (!env.__GLX_VENDOR_LIBRARY_NAME) {
+      env.__GLX_VENDOR_LIBRARY_NAME = 'nvidia';
     }
 
     return env;
@@ -415,13 +449,17 @@ async function launchBrowser() {
           return { ok: false, reason: 'webgl context unavailable' };
         }
         let renderer = '';
+        let vendor = '';
+        let version = '';
         try {
           const dbg = gl.getExtension('WEBGL_debug_renderer_info');
           if (dbg) {
             renderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '';
+            vendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || '';
           }
+          version = gl.getParameter(gl.VERSION) || '';
         } catch {}
-        return { ok: true, renderer };
+        return { ok: true, renderer, vendor, version, context: gl2 ? 'webgl2' : 'webgl' };
       });
       return result;
     } finally {
@@ -449,10 +487,13 @@ async function launchBrowser() {
             await browser.close();
             continue;
           }
-          if (/swiftshader/i.test(test.renderer || '')) {
+          if (/swiftshader|llvmpipe|softpipe/i.test(test.renderer || '')) {
             launchErrors.push(`${cfg.name} args=[${extraArgs.join(' ')}]: fell back to SwiftShader (${test.renderer || 'unknown renderer'})`);
             await browser.close();
             continue;
+          }
+          if (opts.profile) {
+            console.log(`[gpu-diag] launch=${cfg.name} args=[${extraArgs.join(' ')}] context=${test.context} renderer=${test.renderer || 'unknown'} vendor=${test.vendor || 'unknown'} version=${test.version || 'unknown'}`);
           }
         }
 
@@ -485,6 +526,62 @@ async function launchBrowser() {
   }
 
   fail(`Failed to launch Chromium. Launch attempts:\n${details}`);
+}
+
+function collectGpuDiagnostics() {
+  const checks = [];
+  const devs = [
+    '/dev/nvidia0',
+    '/dev/nvidiactl',
+    '/dev/nvidia-uvm',
+    '/dev/nvidia-uvm-tools',
+    '/dev/dri/renderD128',
+    '/dev/dri/card0'
+  ];
+  const libs = [
+    '/usr/lib/x86_64-linux-gnu/libEGL.so.1',
+    '/usr/lib/x86_64-linux-gnu/libGL.so.1',
+    '/usr/lib/libEGL.so.1',
+    '/usr/lib/libGL.so.1',
+    '/lib/x86_64-linux-gnu/libEGL.so.1',
+    '/lib/x86_64-linux-gnu/libGL.so.1'
+  ];
+  const presentDevs = devs.filter((p) => fs.existsSync(p));
+  const presentLibs = libs.filter((p) => fs.existsSync(p));
+
+  checks.push(`dev_nodes=${presentDevs.length > 0 ? presentDevs.join(',') : 'none'}`);
+  checks.push(`egl_gl_libs=${presentLibs.length > 0 ? presentLibs.join(',') : 'none'}`);
+
+  const eglVendor = '/usr/share/glvnd/egl_vendor.d/10_nvidia.json';
+  checks.push(`egl_vendor=${fs.existsSync(eglVendor) ? eglVendor : 'missing'}`);
+
+  const envKeys = [
+    'NVIDIA_VISIBLE_DEVICES',
+    'NVIDIA_DRIVER_CAPABILITIES',
+    '__EGL_VENDOR_LIBRARY_FILENAMES',
+    '__GLX_VENDOR_LIBRARY_NAME',
+    'DISPLAY',
+    'WAYLAND_DISPLAY'
+  ];
+  for (const key of envKeys) {
+    if (process.env[key]) {
+      checks.push(`${key}=${process.env[key]}`);
+    }
+  }
+
+  try {
+    const res = spawnSync('nvidia-smi', ['-L'], { encoding: 'utf8', timeout: 2000 });
+    if (res.status === 0 && res.stdout) {
+      checks.push(`nvidia_smi=${res.stdout.trim().split('\n')[0]}`);
+    } else {
+      const errLine = (res.stderr || '').trim();
+      checks.push(`nvidia_smi=unavailable${errLine ? ` (${errLine})` : ''}`);
+    }
+  } catch (err) {
+    checks.push(`nvidia_smi=error (${err && err.message ? err.message : String(err)})`);
+  }
+
+  return checks;
 }
 
 async function waitRenderReady(page) {
@@ -590,6 +687,11 @@ async function createRenderWorker() {
 async function run() {
   const modelPaths = resolveInputModels();
   fs.mkdirSync(outRoot, { recursive: true });
+
+  if (opts.profile && opts.gpuMode === 'gpu') {
+    const diag = collectGpuDiagnostics();
+    console.log(`[gpu-diag] ${diag.join(' | ')}`);
+  }
 
   const usedNames = new Map();
   const modelJobs = modelPaths.map((modelPath) => {

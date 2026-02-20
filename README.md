@@ -103,6 +103,7 @@ node bin/render-glb.js \
 - Rendering is stabilized by rendering extra frames before capture.
 - Speed-first defaults: antialias off, warmup/view frames set to 1, and GPU mode set to `auto`.
 - Use `--gpu-mode gpu --profile` to verify renderer string and per-stage timing.
+- When `--gpu-mode gpu` and `--profile` are set, the CLI prints `[gpu-diag]` lines with device/env visibility and the WebGL renderer Chrome actually created.
 - If profile logs still show `SwiftShader`, Chrome is not using your real GPU. In that case throughput is mostly CPU-bound (PNG capture/encoding).
 - Transparent background keeps alpha (uses `omitBackground: true`).
 - Offline mode serves Three.js from `node_modules` (default).
@@ -112,3 +113,11 @@ node bin/render-glb.js \
 - `Failed to launch the browser process` with `Operation not permitted` usually means Linux container sandbox restrictions.
 - For Docker/Podman, try running the container with `--security-opt seccomp=unconfined` (or `--cap-add=SYS_ADMIN`).
 - You can also point Puppeteer to an existing browser binary via `PUPPETEER_EXECUTABLE_PATH=/path/to/chrome`.
+
+GPU not being used (SwiftShader or CPU-bound):
+- Run with `--gpu-mode gpu --profile` and inspect the `[gpu-diag]` output. If it shows `dev_nodes=none` or missing EGL/GL libs, the container cannot see GPU devices or graphics libs.
+- In Docker, ensure `--gpus all` and `NVIDIA_DRIVER_CAPABILITIES=graphics,utility,compute` are set, and that `nvidia-smi` works inside the container.
+- Make sure EGL/OpenGL libs are installed (`libegl1`, `libgles2`, `libgl1`, `libglvnd0`) and that `/usr/share/glvnd/egl_vendor.d/10_nvidia.json` exists.
+- If `/usr/share/glvnd/egl_vendor.d/10_nvidia.json` is missing but `libEGL_nvidia.so.0` exists, the CLI will generate a temporary EGL vendor file and set `__EGL_VENDOR_LIBRARY_FILENAMES` automatically.
+- If `libEGL_nvidia.so.0` is missing, install the NVIDIA EGL package that matches your driver (e.g., `libnvidia-egl-<driver-version>` or install the full `nvidia-driver-<version>` package inside the image).
+- If `renderer=SwiftShader` persists, set `PUPPETEER_EXECUTABLE_PATH` to a system Chrome/Chromium with proper GPU support, or run outside the container.
