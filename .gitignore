@@ -1,0 +1,11 @@
+# puppeteer / chrome downloads
+.cache/
+**/.cache/
+**/.cache/puppeteer/
+
+# node
+node_modules/
+
+# code-server / local stuff 
+.local/
+.gitconfig

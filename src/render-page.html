@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <base href="http://render.local/" />
+  <title>GLB Render</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <script id="render-opts" type="application/json">__RENDER_OPTS__</script>
+  <script type="module">
+    const opts = JSON.parse(document.getElementById('render-opts').textContent);
+    const THREE_URL = '__THREE_URL__';
+    const LOADER_URL = '__LOADER_URL__';
+
+    async function main() {
+      const THREE = await import(THREE_URL);
+      const { GLTFLoader } = await import(LOADER_URL);
+
+      const scene = new THREE.Scene();
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: opts.bg === 'transparent' });
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = opts.exposure;
+      renderer.setPixelRatio(1);
+      renderer.setSize(opts.width, opts.height, false);
+
+      if (opts.bg === 'transparent') {
+        renderer.setClearColor(0x000000, 0);
+        scene.background = null;
+      } else {
+        renderer.setClearColor(0xffffff, 1);
+        scene.background = new THREE.Color(0xffffff);
+      }
+
+      document.body.appendChild(renderer.domElement);
+
+      const camera = new THREE.PerspectiveCamera(40, opts.width / opts.height, 0.1, 100);
+      camera.position.set(0, 0, 4);
+      camera.lookAt(0, 0, 0);
+
+      const ambient = new THREE.AmbientLight(0xffffff, 0.4);
+      scene.add(ambient);
+
+      const key = new THREE.DirectionalLight(0xffffff, 1.2);
+      key.position.set(3, 5, 4);
+      scene.add(key);
+
+      const fill = new THREE.DirectionalLight(0x8888ff, 0.3);
+      fill.position.set(-3, 2, -2);
+      scene.add(fill);
+
+      const loader = new GLTFLoader();
+      const gltf = await loader.loadAsync('model.glb');
+      const model = gltf.scene;
+      scene.add(model);
+
+      model.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(model);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const scale = 2.0 / maxDim;
+      model.scale.setScalar(scale);
+      const center = new THREE.Vector3();
+      box.getCenter(center);
+      model.position.sub(center.multiplyScalar(scale));
+
+      camera.lookAt(0, 0, 0);
+
+      for (let i = 0; i < 3; i++) {
+        renderer.render(scene, camera);
+      }
+
+      window.__RENDER_DONE__ = true;
+    }
+
+    main().catch((err) => {
+      console.error('RENDER_ERROR', err);
+      window.__RENDER_ERROR__ = String(err && err.stack ? err.stack : err);
+    });
+  </script>
+</body>
+</html>

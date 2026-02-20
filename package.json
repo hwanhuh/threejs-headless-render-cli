@@ -1,0 +1,17 @@
+{
+  "name": "glb-render-cli",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "render-glb": "bin/render-glb.js"
+  },
+  "scripts": {
+    "render-glb": "node bin/render-glb.js"
+  },
+  "dependencies": {
+    "commander": "^11.1.0",
+    "puppeteer": "^24.0.0",
+    "three": "^0.161.0"
+  }
+}
