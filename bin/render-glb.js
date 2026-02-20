@@ -335,6 +335,24 @@ async function launchBrowser() {
           '--ignore-gpu-blocklist',
           '--enable-gpu-rasterization',
           '--enable-zero-copy',
+          '--use-gl=angle',
+          '--use-angle=gl-egl',
+          '--disable-vulkan',
+          '--disable-software-rasterizer'
+        ],
+        [
+          '--ignore-gpu-blocklist',
+          '--enable-gpu-rasterization',
+          '--enable-zero-copy',
+          '--use-gl=angle',
+          '--use-angle=gles',
+          '--disable-vulkan',
+          '--disable-software-rasterizer'
+        ],
+        [
+          '--ignore-gpu-blocklist',
+          '--enable-gpu-rasterization',
+          '--enable-zero-copy',
           '--disable-software-rasterizer'
         ],
         [
@@ -359,6 +377,32 @@ async function launchBrowser() {
     }
     return [[]];
   }
+
+  function buildBrowserEnv() {
+    const env = { ...process.env };
+    if (opts.gpuMode !== 'gpu') {
+      return env;
+    }
+
+    const nvidiaEglVendor = '/usr/share/glvnd/egl_vendor.d/10_nvidia.json';
+    const nvidiaVkIcd = '/usr/share/vulkan/icd.d/nvidia_icd.json';
+    const nvidiaVkIcdAlt = '/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json';
+
+    if (!env.__EGL_VENDOR_LIBRARY_FILENAMES && fs.existsSync(nvidiaEglVendor)) {
+      env.__EGL_VENDOR_LIBRARY_FILENAMES = nvidiaEglVendor;
+    }
+    if (!env.VK_ICD_FILENAMES) {
+      if (fs.existsSync(nvidiaVkIcd)) {
+        env.VK_ICD_FILENAMES = nvidiaVkIcd;
+      } else if (fs.existsSync(nvidiaVkIcdAlt)) {
+        env.VK_ICD_FILENAMES = nvidiaVkIcdAlt;
+      }
+    }
+
+    return env;
+  }
+
+  const browserEnv = buildBrowserEnv();
 
   async function canCreateWebGL(browser) {
     const page = await browser.newPage();
@@ -394,7 +438,8 @@ async function launchBrowser() {
         const browser = await puppeteer.launch({
           ...cfg.opts,
           executablePath,
-          args
+          args,
+          env: browserEnv
         });
 
         if (opts.gpuMode === 'gpu') {
