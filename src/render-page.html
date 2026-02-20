@@ -71,12 +71,29 @@
       box.getCenter(center);
       model.position.sub(center.multiplyScalar(scale));
 
-      camera.lookAt(0, 0, 0);
+      function applyView(view) {
+        if (view && Number.isFinite(view.fov)) {
+          camera.fov = view.fov;
+          camera.updateProjectionMatrix();
+        }
+        if (view && Number.isFinite(view.x) && Number.isFinite(view.y) && Number.isFinite(view.z)) {
+          camera.position.set(view.x, view.y, view.z);
+        }
+        camera.lookAt(0, 0, 0);
+      }
 
+      applyView(opts.initialView || null);
       for (let i = 0; i < 3; i++) {
         renderer.render(scene, camera);
       }
 
+      window.__SET_VIEW__ = async (view) => {
+        applyView(view);
+        for (let i = 0; i < 2; i++) {
+          renderer.render(scene, camera);
+        }
+        return true;
+      };
       window.__RENDER_DONE__ = true;
     }
 
