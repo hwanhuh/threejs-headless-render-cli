@@ -12,3 +12,5 @@ node_modules/
 
 assets
 *.png
+
+render_test

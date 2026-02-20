@@ -2,6 +2,8 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import os from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import puppeteer from 'puppeteer';
@@ -16,6 +18,7 @@ program
   .option('--dir <path>', 'input directory containing GLB files')
   .option('--out-dir <path>', 'output root directory', 'renders')
   .option('--views <number>', 'number of views per model', (v) => parseInt(v, 10), 24)
+  .option('--workers <number>', 'number of parallel renderer workers', (v) => parseInt(v, 10), Math.min(8, Math.max(1, Math.floor(os.cpus().length / 2))))
   .option('--seed <number>', 'random seed (integer)', (v) => parseInt(v, 10))
   .option('--w <number>', 'width in pixels', (v) => parseInt(v, 10), 1024)
   .option('--h <number>', 'height in pixels', (v) => parseInt(v, 10), 1024)
@@ -30,6 +33,11 @@ program
   .option('--elev-max <number>', 'maximum elevation in degrees', (v) => parseFloat(v), 35)
   .option('--azim-min <number>', 'minimum azimuth in degrees (0 is front)', (v) => parseFloat(v), -120)
   .option('--azim-max <number>', 'maximum azimuth in degrees (0 is front)', (v) => parseFloat(v), 120)
+  .option('--gpu-mode <auto|gpu|swiftshader>', 'chrome GPU mode', 'auto')
+  .option('--antialias', 'enable antialiasing (slower)', false)
+  .option('--warmup-frames <number>', 'frames rendered after model load', (v) => parseInt(v, 10), 1)
+  .option('--view-frames <number>', 'frames rendered before each capture', (v) => parseInt(v, 10), 1)
+  .option('--profile', 'print per-model timing profile', false)
   .option('--recursive', 'scan input directory recursively', true)
   .option('--no-recursive', 'scan input directory only at top level');
 
@@ -44,6 +52,7 @@ function fail(msg) {
 if (!opts.in && !opts.dir) fail('Specify one input source: --in <path> or --dir <path>');
 if (opts.in && opts.dir) fail('Use only one input source: --in or --dir');
 if (!Number.isFinite(opts.views) || opts.views <= 0) fail('views must be a positive number');
+if (!Number.isFinite(opts.workers) || opts.workers <= 0) fail('workers must be a positive number');
 if (!Number.isFinite(opts.w) || opts.w <= 0) fail('Width must be a positive number');
 if (!Number.isFinite(opts.h) || opts.h <= 0) fail('Height must be a positive number');
 if (!['transparent', 'white'].includes(opts.bg)) fail('bg must be transparent or white');
@@ -56,6 +65,9 @@ if (!Number.isFinite(opts.distanceJitter) || opts.distanceJitter < 0) fail('dist
 if (!Number.isFinite(opts.elevMin) || !Number.isFinite(opts.elevMax) || opts.elevMin >= opts.elevMax) fail('elev-min must be less than elev-max');
 if (!Number.isFinite(opts.azimMin) || !Number.isFinite(opts.azimMax) || opts.azimMin >= opts.azimMax) fail('azim-min must be less than azim-max');
 if (opts.seed !== undefined && (!Number.isInteger(opts.seed) || opts.seed < 0)) fail('seed must be a non-negative integer');
+if (!['auto', 'gpu', 'swiftshader'].includes(opts.gpuMode)) fail('gpu-mode must be auto, gpu, or swiftshader');
+if (!Number.isFinite(opts.warmupFrames) || opts.warmupFrames <= 0) fail('warmup-frames must be a positive number');
+if (!Number.isFinite(opts.viewFrames) || opts.viewFrames <= 0) fail('view-frames must be a positive number');
 
 const outRoot = path.resolve(process.cwd(), opts.outDir);
 
@@ -81,6 +93,9 @@ const renderOpts = {
   height: opts.h,
   bg: opts.bg,
   exposure: opts.exposure,
+  antialias: !!opts.antialias,
+  warmupFrames: opts.warmupFrames,
+  viewFrames: opts.viewFrames,
   initialView: null
 };
 
@@ -288,16 +303,16 @@ function startLocalServer() {
 }
 
 async function launchBrowser() {
-  const launchArgs = [
+  const baseLaunchArgs = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--use-angle=swiftshader',
-    '--use-gl=angle',
-    '--enable-unsafe-swiftshader',
+    '--disable-dev-shm-usage'
+  ];
+
+  baseLaunchArgs.push(
     '--disable-breakpad',
     '--disable-crash-reporter'
-  ];
+  );
 
   const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
 
@@ -306,16 +321,100 @@ async function launchBrowser() {
     { name: 'chrome-headless-shell', opts: { headless: 'shell' } }
   ];
 
-  const launchErrors = [];
-  for (const cfg of launchConfigs) {
+  function getGpuArgVariants() {
+    if (opts.gpuMode === 'swiftshader') {
+      return [[
+        '--use-angle=swiftshader',
+        '--use-gl=angle',
+        '--enable-unsafe-swiftshader'
+      ]];
+    }
+    if (opts.gpuMode === 'gpu') {
+      return [
+        [
+          '--ignore-gpu-blocklist',
+          '--enable-gpu-rasterization',
+          '--enable-zero-copy',
+          '--disable-software-rasterizer'
+        ],
+        [
+          '--ignore-gpu-blocklist',
+          '--enable-gpu-rasterization',
+          '--enable-zero-copy',
+          '--use-gl=egl',
+          '--disable-software-rasterizer'
+        ],
+        [
+          '--ignore-gpu-blocklist',
+          '--enable-gpu-rasterization',
+          '--enable-zero-copy',
+          '--use-gl=desktop',
+          '--disable-software-rasterizer'
+        ],
+        [
+          '--ignore-gpu-blocklist',
+          '--enable-gpu-rasterization'
+        ]
+      ];
+    }
+    return [[]];
+  }
+
+  async function canCreateWebGL(browser) {
+    const page = await browser.newPage();
     try {
-      return await puppeteer.launch({
-        ...cfg.opts,
-        executablePath,
-        args: launchArgs
+      const result = await page.evaluate(() => {
+        const canvas = document.createElement('canvas');
+        const gl2 = canvas.getContext('webgl2', { powerPreference: 'high-performance' });
+        const gl = gl2 || canvas.getContext('webgl', { powerPreference: 'high-performance' });
+        if (!gl) {
+          return { ok: false, reason: 'webgl context unavailable' };
+        }
+        let renderer = '';
+        try {
+          const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+          if (dbg) {
+            renderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '';
+          }
+        } catch {}
+        return { ok: true, renderer };
       });
-    } catch (err) {
-      launchErrors.push(`${cfg.name}: ${err && err.message ? err.message : String(err)}`);
+      return result;
+    } finally {
+      await page.close();
+    }
+  }
+
+  const gpuArgVariants = getGpuArgVariants();
+  const launchErrors = [];
+  for (const extraArgs of gpuArgVariants) {
+    for (const cfg of launchConfigs) {
+      const args = baseLaunchArgs.concat(extraArgs);
+      try {
+        const browser = await puppeteer.launch({
+          ...cfg.opts,
+          executablePath,
+          args
+        });
+
+        if (opts.gpuMode === 'gpu') {
+          const test = await canCreateWebGL(browser);
+          if (!test.ok) {
+            launchErrors.push(`${cfg.name} args=[${extraArgs.join(' ')}]: ${test.reason}`);
+            await browser.close();
+            continue;
+          }
+          if (/swiftshader/i.test(test.renderer || '')) {
+            launchErrors.push(`${cfg.name} args=[${extraArgs.join(' ')}]: fell back to SwiftShader (${test.renderer || 'unknown renderer'})`);
+            await browser.close();
+            continue;
+          }
+        }
+
+        return browser;
+      } catch (err) {
+        launchErrors.push(`${cfg.name} args=[${extraArgs.join(' ')}]: ${err && err.message ? err.message : String(err)}`);
+      }
     }
   }
 
@@ -328,6 +427,15 @@ async function launchBrowser() {
       `- Run the CLI outside a restricted container.\n` +
       `- Set PUPPETEER_EXECUTABLE_PATH to a system Chrome/Chromium binary.\n\n` +
       `Launch attempts:\n${details}`
+    );
+  }
+
+  if (opts.gpuMode === 'gpu') {
+    fail(
+      `Failed to create a real GPU WebGL context in --gpu-mode gpu.\n` +
+      `Tried multiple Chrome GPU flag combinations but all failed or fell back to SwiftShader.\n` +
+      `Check NVIDIA driver/container runtime and EGL libraries on this host.\n\n` +
+      `Attempts:\n${details}`
     );
   }
 
@@ -346,30 +454,92 @@ async function waitRenderReady(page) {
   }
 }
 
-async function renderOneModel({ page, app, modelPath, outputDir, views }) {
+async function renderOneModel({ worker, modelPath, outputDir, views }) {
+  const { page, app } = worker;
+  const t0 = performance.now();
   const modelBuffer = fs.readFileSync(modelPath);
   app.setModelBuffer(modelBuffer);
+  const t1 = performance.now();
 
-  await page.goto(`${app.baseUrl}/?m=${Date.now()}`, { waitUntil: 'domcontentloaded' });
-  await waitRenderReady(page);
+  if (!worker.initialized) {
+    await page.goto(`${app.baseUrl}/?m=${Date.now()}`, { waitUntil: 'domcontentloaded' });
+    await waitRenderReady(page);
+    worker.initialized = true;
+  } else {
+    await page.evaluate(async (token) => {
+      if (typeof window.__LOAD_MODEL__ !== 'function') {
+        throw new Error('__LOAD_MODEL__ is not available');
+      }
+      await window.__LOAD_MODEL__(`model.glb?m=${token}`);
+    }, Date.now());
+  }
+  const t2 = performance.now();
 
   fs.mkdirSync(outputDir, { recursive: true });
 
+  let setViewMs = 0;
+  let screenshotMs = 0;
   for (let i = 0; i < views.length; i += 1) {
     const view = views[i];
+    const tv0 = performance.now();
     await page.evaluate(async (v) => {
       if (typeof window.__SET_VIEW__ !== 'function') {
         throw new Error('__SET_VIEW__ is not available');
       }
       await window.__SET_VIEW__(v);
     }, view);
+    const tv1 = performance.now();
+    setViewMs += (tv1 - tv0);
 
     const outputPath = path.join(outputDir, `${String(i + 1).padStart(3, '0')}.png`);
     const screenshotOpts = opts.bg === 'transparent'
-      ? { path: outputPath, omitBackground: true }
-      : { path: outputPath };
+      ? { path: outputPath, omitBackground: true, captureBeyondViewport: false }
+      : { path: outputPath, captureBeyondViewport: false };
+    const ts0 = performance.now();
     await page.screenshot(screenshotOpts);
+    const ts1 = performance.now();
+    screenshotMs += (ts1 - ts0);
   }
+
+  const t3 = performance.now();
+  return {
+    loadBufferMs: t1 - t0,
+    pageLoadMs: t2 - t1,
+    setViewMs,
+    screenshotMs,
+    totalMs: t3 - t0
+  };
+}
+
+async function createRenderWorker() {
+  const browser = await launchBrowser();
+  const app = await startLocalServer();
+  const page = await browser.newPage();
+  await page.setViewport({ width: opts.w, height: opts.h, deviceScaleFactor: 1 });
+
+  const errors = [];
+  page.on('pageerror', (err) => errors.push(err));
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') {
+      const text = msg.text();
+      if (/favicon\\.ico/i.test(text) && /404/i.test(text)) {
+        return;
+      }
+      errors.push(new Error(text));
+    }
+  });
+
+  return {
+    page,
+    app,
+    errors,
+    renderInfo: null,
+    initialized: false,
+    close: async () => {
+      await app.close();
+      await browser.close();
+    }
+  };
 }
 
 async function run() {
@@ -385,49 +555,92 @@ async function run() {
     };
   });
 
-  const browser = await launchBrowser();
-  let app;
-  let page;
+  const workerCount = Math.min(opts.workers, modelJobs.length);
+  const workers = [];
 
   try {
-    app = await startLocalServer();
-    page = await browser.newPage();
-    await page.setViewport({ width: opts.w, height: opts.h, deviceScaleFactor: 1 });
+    for (let i = 0; i < workerCount; i += 1) {
+      workers.push(await createRenderWorker());
+    }
 
-    const errors = [];
-    page.on('pageerror', (err) => errors.push(err));
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') {
-        const text = msg.text();
-        if (/favicon\\.ico/i.test(text) && /404/i.test(text)) {
+    let nextIndex = 0;
+    let completed = 0;
+    let fatalError = null;
+    const globalProfile = {
+      loadBufferMs: 0,
+      pageLoadMs: 0,
+      setViewMs: 0,
+      screenshotMs: 0,
+      totalMs: 0
+    };
+
+    const runWorkerLoop = async (worker, workerId) => {
+      while (true) {
+        if (fatalError) {
           return;
         }
-        errors.push(new Error(text));
+        const jobIndex = nextIndex;
+        nextIndex += 1;
+        if (jobIndex >= modelJobs.length) {
+          return;
+        }
+
+        const { modelPath, outputDir } = modelJobs[jobIndex];
+        const modelSeed = opts.seed !== undefined
+          ? ((opts.seed >>> 0) + ((jobIndex + 1) * 2654435761 >>> 0)) >>> 0
+          : (Date.now() + jobIndex * 7919) >>> 0;
+        const rng = mulberry32(modelSeed);
+        const views = generateViews(opts.views, rng);
+
+        if (worker.errors.length > 0) {
+          throw worker.errors[0];
+        }
+
+        const modelProfile = await renderOneModel({ worker, modelPath, outputDir, views });
+
+        if (!worker.renderInfo) {
+          worker.renderInfo = await worker.page.evaluate(() => window.__RENDER_INFO__ || null);
+          if (opts.profile && worker.renderInfo) {
+            console.log(`[worker ${workerId}] renderer=${worker.renderInfo.glRenderer || 'unknown'} vendor=${worker.renderInfo.glVendor || 'unknown'} antialias=${worker.renderInfo.antialias} warmupFrames=${worker.renderInfo.warmupFrames} viewFrames=${worker.renderInfo.viewFrames}`);
+          }
+          if (worker.renderInfo && /swiftshader/i.test(worker.renderInfo.glRenderer || '') && opts.gpuMode !== 'swiftshader') {
+            console.warn(`[worker ${workerId}] warning: Chrome is using SwiftShader software rendering. Check NVIDIA/EGL runtime setup for real GPU acceleration.`);
+          }
+        }
+
+        if (worker.errors.length > 0) {
+          throw worker.errors[0];
+        }
+
+        globalProfile.loadBufferMs += modelProfile.loadBufferMs;
+        globalProfile.pageLoadMs += modelProfile.pageLoadMs;
+        globalProfile.setViewMs += modelProfile.setViewMs;
+        globalProfile.screenshotMs += modelProfile.screenshotMs;
+        globalProfile.totalMs += modelProfile.totalMs;
+
+        completed += 1;
+        console.log(`[${completed}/${modelJobs.length}] [worker ${workerId}] rendered ${modelPath} -> ${outputDir}`);
+        if (opts.profile) {
+          console.log(`[profile] model=${path.basename(modelPath)} total=${modelProfile.totalMs.toFixed(1)}ms loadBuffer=${modelProfile.loadBufferMs.toFixed(1)}ms pageLoad=${modelProfile.pageLoadMs.toFixed(1)}ms setView=${modelProfile.setViewMs.toFixed(1)}ms screenshot=${modelProfile.screenshotMs.toFixed(1)}ms`);
+        }
       }
-    });
+    };
 
-    for (let i = 0; i < modelJobs.length; i += 1) {
-      const { modelPath, outputDir } = modelJobs[i];
-      const modelSeed = opts.seed !== undefined
-        ? ((opts.seed >>> 0) + ((i + 1) * 2654435761 >>> 0)) >>> 0
-        : (Date.now() + i * 7919) >>> 0;
-      const rng = mulberry32(modelSeed);
-      const views = generateViews(opts.views, rng);
+    await Promise.all(
+      workers.map((worker, i) =>
+        runWorkerLoop(worker, i + 1).catch((err) => {
+          fatalError = err;
+          throw err;
+        })
+      )
+    );
 
-      await renderOneModel({ page, app, modelPath, outputDir, views });
-      console.log(`[${i + 1}/${modelJobs.length}] rendered ${modelPath} -> ${outputDir}`);
-    }
-
-    if (errors.length > 0) {
-      throw errors[0];
+    if (opts.profile) {
+      const n = modelJobs.length || 1;
+      console.log(`[profile-summary] models=${modelJobs.length} workers=${workerCount} avg_total=${(globalProfile.totalMs / n).toFixed(1)}ms avg_pageLoad=${(globalProfile.pageLoadMs / n).toFixed(1)}ms avg_setView=${(globalProfile.setViewMs / n).toFixed(1)}ms avg_screenshot=${(globalProfile.screenshotMs / n).toFixed(1)}ms`);
     }
   } finally {
-    if (app) {
-      await app.close();
-    }
-    if (browser) {
-      await browser.close();
-    }
+    await Promise.all(workers.map((worker) => worker.close().catch(() => {})));
   }
 }
 

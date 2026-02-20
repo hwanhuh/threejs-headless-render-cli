@@ -23,7 +23,25 @@
 
       const scene = new THREE.Scene();
 
-      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: opts.bg === 'transparent' });
+      const canvas = document.createElement('canvas');
+      const contextAttrs = {
+        antialias: !!opts.antialias,
+        alpha: opts.bg === 'transparent',
+        powerPreference: 'high-performance'
+      };
+      const gl2 = canvas.getContext('webgl2', contextAttrs);
+      const gl = gl2 || canvas.getContext('webgl', contextAttrs) || canvas.getContext('experimental-webgl', contextAttrs);
+      if (!gl) {
+        throw new Error('Unable to create WebGL context (webgl2/webgl)');
+      }
+
+      const renderer = new THREE.WebGLRenderer({
+        canvas,
+        context: gl,
+        antialias: !!opts.antialias,
+        alpha: opts.bg === 'transparent',
+        powerPreference: 'high-performance'
+      });
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
       renderer.toneMappingExposure = opts.exposure;
@@ -55,21 +73,55 @@
       fill.position.set(-3, 2, -2);
       scene.add(fill);
 
-      const loader = new GLTFLoader();
-      const gltf = await loader.loadAsync('model.glb');
-      const model = gltf.scene;
-      scene.add(model);
+      function disposeObject(obj) {
+        obj.traverse((child) => {
+          if (child.geometry && typeof child.geometry.dispose === 'function') {
+            child.geometry.dispose();
+          }
+          const mats = child.material ? (Array.isArray(child.material) ? child.material : [child.material]) : [];
+          for (const mat of mats) {
+            if (!mat) continue;
+            for (const key of Object.keys(mat)) {
+              const value = mat[key];
+              if (value && value.isTexture && typeof value.dispose === 'function') {
+                value.dispose();
+              }
+            }
+            if (typeof mat.dispose === 'function') {
+              mat.dispose();
+            }
+          }
+        });
+      }
 
-      model.updateMatrixWorld(true);
-      const box = new THREE.Box3().setFromObject(model);
-      const size = new THREE.Vector3();
-      box.getSize(size);
-      const maxDim = Math.max(size.x, size.y, size.z);
-      const scale = 2.0 / maxDim;
-      model.scale.setScalar(scale);
-      const center = new THREE.Vector3();
-      box.getCenter(center);
-      model.position.sub(center.multiplyScalar(scale));
+      function normalizeModel(model) {
+        model.updateMatrixWorld(true);
+        const box = new THREE.Box3().setFromObject(model);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const maxDim = Math.max(size.x, size.y, size.z);
+        const safeMaxDim = Number.isFinite(maxDim) && maxDim > 0 ? maxDim : 1;
+        const scale = 2.0 / safeMaxDim;
+        model.scale.setScalar(scale);
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        model.position.sub(center.multiplyScalar(scale));
+      }
+
+      const loader = new GLTFLoader();
+      let currentModel = null;
+
+      async function loadModel(url) {
+        if (currentModel) {
+          scene.remove(currentModel);
+          disposeObject(currentModel);
+          currentModel = null;
+        }
+        const gltf = await loader.loadAsync(url);
+        currentModel = gltf.scene;
+        scene.add(currentModel);
+        normalizeModel(currentModel);
+      }
 
       function applyView(view) {
         if (view && Number.isFinite(view.fov)) {
@@ -82,14 +134,43 @@
         camera.lookAt(0, 0, 0);
       }
 
+      const warmupFrames = Number.isFinite(opts.warmupFrames) ? Math.max(1, opts.warmupFrames) : 1;
+      const viewFrames = Number.isFinite(opts.viewFrames) ? Math.max(1, opts.viewFrames) : 1;
+
+      await loadModel('model.glb');
       applyView(opts.initialView || null);
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0; i < warmupFrames; i++) {
         renderer.render(scene, camera);
       }
 
+      const glCtx = renderer.getContext();
+      let glVendor = '';
+      let glRenderer = '';
+      try {
+        const dbg = glCtx.getExtension('WEBGL_debug_renderer_info');
+        if (dbg) {
+          glVendor = glCtx.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || '';
+          glRenderer = glCtx.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '';
+        }
+      } catch {}
+      window.__RENDER_INFO__ = {
+        glVendor,
+        glRenderer,
+        antialias: !!opts.antialias,
+        warmupFrames,
+        viewFrames
+      };
+
       window.__SET_VIEW__ = async (view) => {
         applyView(view);
-        for (let i = 0; i < 2; i++) {
+        for (let i = 0; i < viewFrames; i++) {
+          renderer.render(scene, camera);
+        }
+        return true;
+      };
+      window.__LOAD_MODEL__ = async (url) => {
+        await loadModel(url || 'model.glb');
+        for (let i = 0; i < warmupFrames; i++) {
           renderer.render(scene, camera);
         }
         return true;
