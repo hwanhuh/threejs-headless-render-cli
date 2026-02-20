@@ -35,3 +35,8 @@ node bin/render-glb.js --in ./model.glb --bg white --three cdn
 - Transparent background keeps alpha (uses `omitBackground: true`).
 - Offline mode serves Three.js from `node_modules` (default).
 - CDN mode loads from unpkg; requires network access.
+
+## Troubleshooting
+- `Failed to launch the browser process` with `Operation not permitted` usually means Linux container sandbox restrictions.
+- For Docker/Podman, try running the container with `--security-opt seccomp=unconfined` (or `--cap-add=SYS_ADMIN`).
+- You can also point Puppeteer to an existing browser binary via `PUPPETEER_EXECUTABLE_PATH=/path/to/chrome`.

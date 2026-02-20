@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
@@ -50,10 +51,10 @@ try {
 
 const threeUrl = opts.three === 'cdn'
   ? `https://unpkg.com/three@${threeVersion}/build/three.module.js`
-  : 'three.module.js';
+  : '/three.module.js';
 const loaderUrl = opts.three === 'cdn'
   ? `https://unpkg.com/three@${threeVersion}/examples/jsm/loaders/GLTFLoader.js`
-  : 'GLTFLoader.js';
+  : '/examples/jsm/loaders/GLTFLoader.js';
 
 const renderOpts = {
   width: opts.w,
@@ -61,6 +62,12 @@ const renderOpts = {
   bg: opts.bg,
   exposure: opts.exposure
 };
+const debugRender = process.env.DEBUG_RENDER === '1';
+function debugLog(...args) {
+  if (debugRender) {
+    console.error('[render-debug]', ...args);
+  }
+}
 
 const html = htmlTemplate
   .replace('__RENDER_OPTS__', JSON.stringify(renderOpts))
@@ -69,20 +76,154 @@ const html = htmlTemplate
 
 const modelBuffer = fs.readFileSync(inputPath);
 
-const serverHost = 'http://render.local';
-
 const localThreePath = path.join(projectRoot, 'node_modules', 'three', 'build', 'three.module.js');
-const localLoaderPath = path.join(projectRoot, 'node_modules', 'three', 'examples', 'jsm', 'loaders', 'GLTFLoader.js');
+const localExamplesRoot = path.join(projectRoot, 'node_modules', 'three', 'examples', 'jsm');
+const localLoaderPath = path.join(localExamplesRoot, 'loaders', 'GLTFLoader.js');
 
 if (opts.three === 'local') {
-  if (!fs.existsSync(localThreePath) || !fs.existsSync(localLoaderPath)) {
+  if (!fs.existsSync(localThreePath) || !fs.existsSync(localExamplesRoot) || !fs.existsSync(localLoaderPath)) {
     fail('three.js not found in node_modules. Run npm install or use --three cdn');
   }
 }
 
+function patchLoaderImportsForBrowser(src) {
+  return src
+    .replaceAll("from 'three';", "from '/three.module.js';")
+    .replaceAll('from "three";', 'from "/three.module.js";');
+}
+
+function startLocalServer() {
+  const server = http.createServer((req, res) => {
+    try {
+      const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
+      const pathname = reqUrl.pathname;
+      debugLog('http', req.method, pathname);
+
+      if (pathname === '/') {
+        debugLog('serve html');
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+        return;
+      }
+
+      if (pathname === '/model.glb') {
+        debugLog('serve model');
+        res.writeHead(200, { 'Content-Type': 'model/gltf-binary' });
+        res.end(modelBuffer);
+        return;
+      }
+
+      if (pathname === '/favicon.ico') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      if (opts.three === 'local') {
+        if (pathname === '/three.module.js') {
+          debugLog('serve three.module.js');
+          res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8' });
+          res.end(patchLoaderImportsForBrowser(fs.readFileSync(localThreePath, 'utf8')));
+          return;
+        }
+
+        if (pathname.startsWith('/examples/jsm/')) {
+          const relative = pathname.replace('/examples/jsm/', '');
+          const filePath = path.resolve(localExamplesRoot, relative);
+          if (filePath.startsWith(localExamplesRoot + path.sep) && fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+            debugLog('serve jsm', relative);
+            res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8' });
+            res.end(patchLoaderImportsForBrowser(fs.readFileSync(filePath, 'utf8')));
+            return;
+          }
+        }
+
+        debugLog('local 404', pathname);
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Not found');
+        return;
+      }
+
+      debugLog('cdn/local generic 404', pathname);
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Not found');
+    } catch (err) {
+      debugLog('server error', err && err.stack ? err.stack : err);
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(`Server error: ${err && err.message ? err.message : String(err)}`);
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      if (!addr || typeof addr === 'string') {
+        server.close(() => reject(new Error('Failed to bind local server')));
+        return;
+      }
+      resolve({
+        baseUrl: `http://127.0.0.1:${addr.port}`,
+        close: () => new Promise((closeResolve) => server.close(() => closeResolve()))
+      });
+    });
+  });
+}
+
 async function run() {
-  const browser = await puppeteer.launch({ headless: 'new' });
+  const launchArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--use-angle=swiftshader',
+    '--use-gl=angle',
+    '--enable-unsafe-swiftshader',
+    '--disable-breakpad',
+    '--disable-crash-reporter'
+  ];
+
+  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
+
+  const launchConfigs = [
+    { name: 'chrome(headless:new)', opts: { headless: 'new' } },
+    { name: 'chrome-headless-shell', opts: { headless: 'shell' } }
+  ];
+
+  let browser;
+  const launchErrors = [];
+  for (const cfg of launchConfigs) {
+    try {
+      browser = await puppeteer.launch({
+        ...cfg.opts,
+        executablePath,
+        args: launchArgs
+      });
+      break;
+    } catch (err) {
+      launchErrors.push(`${cfg.name}: ${err && err.message ? err.message : String(err)}`);
+    }
+  }
+
+  if (!browser) {
+    const details = launchErrors.join('\n\n');
+    if (/Operation not permitted|sandbox_host_linux\.cc|crashpad/i.test(details)) {
+      fail(
+        `Failed to launch Chromium in this environment (Linux sandbox restriction).\n` +
+        `Try one of the following:\n` +
+        `- If running in Docker/Podman, add --security-opt seccomp=unconfined (or --cap-add=SYS_ADMIN).\n` +
+        `- Run the CLI outside a restricted container.\n` +
+        `- Set PUPPETEER_EXECUTABLE_PATH to a system Chrome/Chromium binary.\n\n` +
+        `Launch attempts:\n${details}`
+      );
+    }
+
+    fail(`Failed to launch Chromium. Launch attempts:\n${details}`);
+  }
+
+  let app;
   try {
+    app = await startLocalServer();
+
     const page = await browser.newPage();
     await page.setViewport({ width: opts.w, height: opts.h, deviceScaleFactor: 1 });
 
@@ -90,53 +231,24 @@ async function run() {
     page.on('pageerror', (err) => errors.push(err));
     page.on('console', (msg) => {
       if (msg.type() === 'error') {
-        errors.push(new Error(msg.text()));
+        const text = msg.text();
+        if (/favicon\\.ico/i.test(text) && /404/i.test(text)) {
+          return;
+        }
+        errors.push(new Error(text));
       }
     });
 
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const url = req.url();
+    await page.goto(app.baseUrl, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(
+      'window.__RENDER_DONE__ === true || typeof window.__RENDER_ERROR__ === "string"',
+      { timeout: 30000 }
+    );
 
-      if (url === `${serverHost}/model.glb`) {
-        req.respond({
-          status: 200,
-          headers: { 'Content-Type': 'model/gltf-binary' },
-          body: modelBuffer
-        });
-        return;
-      }
-
-      if (opts.three === 'local') {
-        if (url === `${serverHost}/three.module.js`) {
-          req.respond({
-            status: 200,
-            headers: { 'Content-Type': 'application/javascript' },
-            body: fs.readFileSync(localThreePath)
-          });
-          return;
-        }
-        if (url === `${serverHost}/GLTFLoader.js`) {
-          req.respond({
-            status: 200,
-            headers: { 'Content-Type': 'application/javascript' },
-            body: fs.readFileSync(localLoaderPath)
-          });
-          return;
-        }
-
-        // Block all other external requests in offline mode.
-        if (!url.startsWith(serverHost)) {
-          req.abort();
-          return;
-        }
-      }
-
-      req.continue();
-    });
-
-    await page.setContent(html, { waitUntil: 'domcontentloaded' });
-    await page.waitForFunction('window.__RENDER_DONE__ === true', { timeout: 30000 });
+    const renderError = await page.evaluate(() => window.__RENDER_ERROR__ || null);
+    if (renderError) {
+      throw new Error(renderError);
+    }
 
     if (errors.length > 0) {
       throw errors[0];
@@ -148,6 +260,9 @@ async function run() {
 
     await page.screenshot(screenshotOpts);
   } finally {
+    if (app) {
+      await app.close();
+    }
     await browser.close();
   }
 }
