@@ -2,6 +2,34 @@
 
 Headless GLB renderer using Three.js and Puppeteer. Supports single-model and directory batch rendering to multi-view PNGs.
 
+## Prerequisites
+
+Base (all servers):
+- Node.js 20+ and npm
+- Linux libraries required by Chromium/Puppeteer:
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  ca-certificates fonts-liberation libatk-bridge2.0-0 libatk1.0-0 \
+  libc6 libcairo2 libcups2 libdbus-1-3 libdrm2 libexpat1 libfontconfig1 \
+  libgbm1 libgcc1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 \
+  libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 \
+  libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 \
+  libxshmfence1 libxss1 libxtst6 xdg-utils wget
+```
+
+For GPU rendering (`--gpu-mode gpu`):
+- NVIDIA driver installed on host (`nvidia-smi` must work)
+- NVIDIA Container Toolkit if running in Docker
+- EGL/OpenGL runtime libraries:
+```bash
+sudo apt-get install -y libegl1 libgles2 libgl1 libglvnd0
+```
+
+Docker runtime requirements (GPU):
+- Start container with `--gpus all`
+- NVIDIA runtime must be visible inside container (`nvidia-smi`)
+
 ## Install
 
 ```bash
