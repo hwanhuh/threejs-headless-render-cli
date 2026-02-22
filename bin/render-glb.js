@@ -16,7 +16,7 @@ const projectRoot = path.resolve(__dirname, '..');
 const program = new Command();
 program
   .option('--in <path>', 'input GLB file path')
-  .option('--dir <path>', 'input directory containing GLB files')
+  .option('--dir <path...>', 'input directory containing GLB files (can pass multiple, shell globs supported)')
   .option('--out-dir <path>', 'output root directory', 'renders')
   .option('--views <number>', 'number of views per model', (v) => parseInt(v, 10), 24)
   .option('--workers <number>', 'number of parallel renderer workers', (v) => parseInt(v, 10), Math.min(8, Math.max(1, Math.floor(os.cpus().length / 2))))
@@ -41,6 +41,7 @@ program
   .option('--warmup-frames <number>', 'frames rendered after model load', (v) => parseInt(v, 10), 1)
   .option('--view-frames <number>', 'frames rendered before each capture', (v) => parseInt(v, 10), 1)
   .option('--profile', 'print per-model timing profile', false)
+  .option('--resume', 'skip already-rendered views and models', false)
   .option('--recursive', 'scan input directory recursively', true)
   .option('--no-recursive', 'scan input directory only at top level');
 
@@ -236,6 +237,76 @@ function makeUniqueDirName(baseName, usedNames) {
   return `${baseName}_${String(count + 1).padStart(2, '0')}`;
 }
 
+function isViewComplete(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    return stat.isFile() && stat.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+const COMPLETE_MARKER = 'render.complete';
+
+function isLikelyValidGlb(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size < 12) return false;
+    const fd = fs.openSync(filePath, 'r');
+    const header = Buffer.alloc(12);
+    const bytes = fs.readSync(fd, header, 0, 12, 0);
+    fs.closeSync(fd);
+    if (bytes < 12) return false;
+    const magic = header.readUInt32LE(0);
+    const version = header.readUInt32LE(4);
+    const length = header.readUInt32LE(8);
+    if (magic !== 0x46546c67) return false; // 'glTF'
+    if (version !== 2 && version !== 1) return false;
+    if (length !== stat.size) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isModelComplete(outputDir, viewCount) {
+  if (!fs.existsSync(outputDir)) return false;
+  for (let i = 0; i < viewCount; i += 1) {
+    const outputPath = path.join(outputDir, `${String(i + 1).padStart(3, '0')}.png`);
+    if (!isViewComplete(outputPath)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isModelCompleteFast(outputDir, viewCount) {
+  const markerPath = path.join(outputDir, COMPLETE_MARKER);
+  if (isViewComplete(markerPath)) {
+    return true;
+  }
+  return isModelComplete(outputDir, viewCount);
+}
+
+function markModelComplete(outputDir) {
+  const markerPath = path.join(outputDir, COMPLETE_MARKER);
+  try {
+    fs.writeFileSync(markerPath, 'ok\n', { encoding: 'utf8' });
+  } catch {
+    // best-effort marker; rendering output is still valid without it
+  }
+}
+
+function consumeWorkerErrors(worker, context) {
+  if (!worker.errors || worker.errors.length === 0) return false;
+  const errors = worker.errors.splice(0, worker.errors.length);
+  console.warn(`[worker ${context.workerId}] warning: ${errors.length} page error(s) detected while ${context.phase}`);
+  for (const err of errors) {
+    console.warn(err && err.stack ? err.stack : err);
+  }
+  return true;
+}
+
 function resolveInputModels() {
   if (opts.in) {
     const inputPath = path.resolve(process.cwd(), opts.in);
@@ -244,13 +315,21 @@ function resolveInputModels() {
     return [inputPath];
   }
 
-  const inputDir = path.resolve(process.cwd(), opts.dir);
-  if (!fs.existsSync(inputDir)) fail(`Input directory not found: ${opts.dir}`);
-  if (!fs.statSync(inputDir).isDirectory()) fail(`Input path is not a directory: ${opts.dir}`);
+  const inputDirs = Array.isArray(opts.dir) ? opts.dir : [opts.dir];
+  const resolvedDirs = inputDirs.map((dir) => path.resolve(process.cwd(), dir));
+  for (let i = 0; i < resolvedDirs.length; i += 1) {
+    const inputDir = resolvedDirs[i];
+    if (!fs.existsSync(inputDir)) fail(`Input directory not found: ${inputDirs[i]}`);
+    if (!fs.statSync(inputDir).isDirectory()) fail(`Input path is not a directory: ${inputDirs[i]}`);
+  }
 
-  const files = collectGlbFiles(inputDir, opts.recursive);
-  if (files.length === 0) fail(`No .glb files found in directory: ${opts.dir}`);
-  return files;
+  const files = [];
+  for (const inputDir of resolvedDirs) {
+    files.push(...collectGlbFiles(inputDir, opts.recursive));
+  }
+  const unique = Array.from(new Set(files)).sort();
+  if (unique.length === 0) fail(`No .glb files found in directory: ${inputDirs.join(', ')}`);
+  return unique;
 }
 
 function startLocalServer() {
@@ -661,24 +740,26 @@ async function renderOneModel({ worker, modelPath, outputDir, views }) {
   let screenshotMs = 0;
   for (let i = 0; i < views.length; i += 1) {
     const view = views[i];
-    const tv0 = performance.now();
-    await page.evaluate(async (v) => {
-      if (typeof window.__SET_VIEW__ !== 'function') {
-        throw new Error('__SET_VIEW__ is not available');
-      }
-      await window.__SET_VIEW__(v);
-    }, view);
-    const tv1 = performance.now();
-    setViewMs += (tv1 - tv0);
-
     const outputPath = path.join(outputDir, `${String(i + 1).padStart(3, '0')}.png`);
-    const screenshotOpts = opts.bg === 'transparent'
-      ? { path: outputPath, omitBackground: true, captureBeyondViewport: false }
-      : { path: outputPath, captureBeyondViewport: false };
-    const ts0 = performance.now();
-    await page.screenshot(screenshotOpts);
-    const ts1 = performance.now();
-    screenshotMs += (ts1 - ts0);
+    if (!opts.resume || !isViewComplete(outputPath)) {
+      const tv0 = performance.now();
+      await page.evaluate(async (v) => {
+        if (typeof window.__SET_VIEW__ !== 'function') {
+          throw new Error('__SET_VIEW__ is not available');
+        }
+        await window.__SET_VIEW__(v);
+      }, view);
+      const tv1 = performance.now();
+      setViewMs += (tv1 - tv0);
+
+      const screenshotOpts = opts.bg === 'transparent'
+        ? { path: outputPath, omitBackground: true, captureBeyondViewport: false }
+        : { path: outputPath, captureBeyondViewport: false };
+      const ts0 = performance.now();
+      await page.screenshot(screenshotOpts);
+      const ts1 = performance.now();
+      screenshotMs += (ts1 - ts0);
+    }
   }
 
   const t3 = performance.now();
@@ -732,7 +813,7 @@ async function run() {
   }
 
   const usedNames = new Map();
-  const modelJobs = modelPaths.map((modelPath) => {
+  const modelJobsAll = modelPaths.map((modelPath) => {
     const uniqueName = makeUniqueDirName(safeBaseName(modelPath), usedNames);
     return {
       modelPath,
@@ -740,8 +821,43 @@ async function run() {
     };
   });
 
+  let skippedComplete = 0;
+  let skippedInvalid = 0;
+  const invalidLogPath = path.join(outRoot, 'invalid_glb.txt');
+  const precheckStart = performance.now();
+  let precheckLastLog = precheckStart;
+  const precheckLogEvery = 5000;
+  const modelJobs = [];
+  for (let i = 0; i < modelJobsAll.length; i += 1) {
+    const job = modelJobsAll[i];
+    if (opts.resume && isModelCompleteFast(job.outputDir, opts.views)) {
+      skippedComplete += 1;
+    } else if (!isLikelyValidGlb(job.modelPath)) {
+      skippedInvalid += 1;
+      console.warn(`[precheck] invalid glb skipped ${job.modelPath}`);
+      try {
+        fs.appendFileSync(invalidLogPath, `${job.modelPath}\n`, { encoding: 'utf8' });
+      } catch {}
+    } else {
+      modelJobs.push(job);
+    }
+    if ((i + 1) % precheckLogEvery === 0) {
+      const now = performance.now();
+      const elapsed = (now - precheckStart) / 1000;
+      const delta = (now - precheckLastLog) / 1000;
+      precheckLastLog = now;
+      console.log(`[precheck] scanned=${i + 1}/${modelJobsAll.length} pending=${modelJobs.length} skipped_complete=${skippedComplete} skipped_invalid=${skippedInvalid} elapsed=${elapsed.toFixed(1)}s (+${delta.toFixed(1)}s)`);
+    }
+  }
+
+  if (opts.resume || skippedInvalid > 0) {
+    const elapsed = (performance.now() - precheckStart) / 1000;
+    console.log(`[precheck] total=${modelJobsAll.length} pending=${modelJobs.length} skipped_complete=${skippedComplete} skipped_invalid=${skippedInvalid} elapsed=${elapsed.toFixed(1)}s`);
+  }
+
   const workerCount = Math.min(opts.workers, modelJobs.length);
   const workers = [];
+  let heartbeatTimer = null;
 
   try {
     for (let i = 0; i < workerCount; i += 1) {
@@ -777,11 +893,25 @@ async function run() {
         const rng = mulberry32(modelSeed);
         const views = generateViews(opts.views, rng);
 
-        if (worker.errors.length > 0) {
-          throw worker.errors[0];
+        if (consumeWorkerErrors(worker, { workerId, phase: 'idle' })) {
+          worker.initialized = false;
         }
 
-        const modelProfile = await renderOneModel({ worker, modelPath, outputDir, views });
+        if (opts.resume && isModelCompleteFast(outputDir, opts.views)) {
+          completed += 1;
+          console.log(`[${completed}/${modelJobs.length}] [worker ${workerId}] skipped (already complete) ${modelPath} -> ${outputDir}`);
+          continue;
+        }
+
+        let modelProfile;
+        try {
+          modelProfile = await renderOneModel({ worker, modelPath, outputDir, views });
+        } catch (err) {
+          console.error(`[${completed + 1}/${modelJobs.length}] [worker ${workerId}] error ${modelPath} -> ${outputDir}`);
+          console.error(err && err.stack ? err.stack : err);
+          worker.initialized = false;
+          continue;
+        }
 
         if (!worker.renderInfo) {
           worker.renderInfo = await worker.page.evaluate(() => window.__RENDER_INFO__ || null);
@@ -793,8 +923,8 @@ async function run() {
           }
         }
 
-        if (worker.errors.length > 0) {
-          throw worker.errors[0];
+        if (consumeWorkerErrors(worker, { workerId, phase: 'rendering' })) {
+          worker.initialized = false;
         }
 
         globalProfile.loadBufferMs += modelProfile.loadBufferMs;
@@ -805,11 +935,20 @@ async function run() {
 
         completed += 1;
         console.log(`[${completed}/${modelJobs.length}] [worker ${workerId}] rendered ${modelPath} -> ${outputDir}`);
+        markModelComplete(outputDir);
         if (opts.profile) {
           console.log(`[profile] model=${path.basename(modelPath)} total=${modelProfile.totalMs.toFixed(1)}ms loadBuffer=${modelProfile.loadBufferMs.toFixed(1)}ms pageLoad=${modelProfile.pageLoadMs.toFixed(1)}ms setView=${modelProfile.setViewMs.toFixed(1)}ms screenshot=${modelProfile.screenshotMs.toFixed(1)}ms`);
         }
       }
     };
+
+    if (workerCount > 0) {
+      heartbeatTimer = setInterval(() => {
+        const remaining = modelJobs.length - completed;
+        console.log(`[heartbeat] completed=${completed} remaining=${remaining} workers=${workerCount}`);
+      }, 30_000);
+      if (heartbeatTimer.unref) heartbeatTimer.unref();
+    }
 
     await Promise.all(
       workers.map((worker, i) =>
@@ -825,6 +964,7 @@ async function run() {
       console.log(`[profile-summary] models=${modelJobs.length} workers=${workerCount} avg_total=${(globalProfile.totalMs / n).toFixed(1)}ms avg_pageLoad=${(globalProfile.pageLoadMs / n).toFixed(1)}ms avg_setView=${(globalProfile.setViewMs / n).toFixed(1)}ms avg_screenshot=${(globalProfile.screenshotMs / n).toFixed(1)}ms`);
     }
   } finally {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     await Promise.all(workers.map((worker) => worker.close().catch(() => {})));
   }
 }
