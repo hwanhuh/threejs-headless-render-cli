@@ -72,6 +72,7 @@
       key.position.set(3, 5, 4);
       fill.position.set(-3, 2, -2);
       rim.position.set(0, 3, -5);
+      rim.position.set(0, 3, -5);
       lowFill.position.set(0, -2, 0);
       sideFill.position.set(-4, 1, 0);
       if (!opts.envUrl) {
@@ -120,6 +121,11 @@
 
       const loader = new GLTFLoader();
       let currentModel = null;
+      const originalMaterials = new Map();
+
+      const normalMaterial = new THREE.MeshNormalMaterial();
+      const geometryMaterial = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.6, metalness: 0.1 });
+      const wireframeMaterial = new THREE.MeshBasicMaterial({ color: 0x44ff88, wireframe: true, transparent: true, opacity: 0.7 });
 
       if (opts.envUrl) {
         const pmrem = new THREE.PMREMGenerator(renderer);
@@ -142,16 +148,39 @@
         }
       }
 
+      function applyMaterialMode(mode) {
+        if (!currentModel) return;
+        const target = (mode || 'color').toLowerCase();
+        currentModel.traverse((child) => {
+          if (!child.isMesh && !child.isSkinnedMesh) return;
+          if (target === 'color') {
+            if (originalMaterials.has(child.uuid)) {
+              child.material = originalMaterials.get(child.uuid);
+            }
+            return;
+          }
+          if (target === 'normal') child.material = normalMaterial;
+          if (target === 'geometry') child.material = geometryMaterial;
+          if (target === 'wireframe') child.material = wireframeMaterial;
+        });
+      }
+
       async function loadModel(url) {
         if (currentModel) {
           scene.remove(currentModel);
           disposeObject(currentModel);
           currentModel = null;
+          originalMaterials.clear();
         }
         const gltf = await loader.loadAsync(url);
         currentModel = gltf.scene;
+        currentModel.traverse((child) => {
+          if (!child.isMesh && !child.isSkinnedMesh) return;
+          originalMaterials.set(child.uuid, child.material);
+        });
         scene.add(currentModel);
         normalizeModel(currentModel);
+        applyMaterialMode(opts.materialMode || 'color');
       }
 
       function applyView(view) {

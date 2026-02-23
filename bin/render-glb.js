@@ -17,6 +17,9 @@ const program = new Command();
 program
   .option('--in <path>', 'input GLB file path')
   .option('--dir <path...>', 'input directory containing GLB files (can pass multiple, shell globs supported)')
+  .option('--list <path>', 'text file with one GLB path per line')
+  .option('--list-jsonl <path>', 'JSONL file containing GLB paths')
+  .option('--list-key <key>', 'key to read from JSONL (default: path or glb_path)', '')
   .option('--out-dir <path>', 'output root directory', 'renders')
   .option('--views <number>', 'number of views per model', (v) => parseInt(v, 10), 24)
   .option('--workers <number>', 'number of parallel renderer workers', (v) => parseInt(v, 10), Math.min(8, Math.max(1, Math.floor(os.cpus().length / 2))))
@@ -24,6 +27,7 @@ program
   .option('--w <number>', 'width in pixels', (v) => parseInt(v, 10), 1024)
   .option('--h <number>', 'height in pixels', (v) => parseInt(v, 10), 1024)
   .option('--bg <transparent|white>', 'background', 'transparent')
+  .option('--material <color|geometry|normal|wireframe>', 'material mode', 'color')
   .option('--exposure <number>', 'tone mapping exposure', (v) => parseFloat(v), 1.35)
   .option('--env <path>', 'environment map (.hdr or .exr) for lighting only')
   .option('--env-intensity <number>', 'environment intensity', (v) => parseFloat(v), 1.0)
@@ -53,13 +57,15 @@ function fail(msg) {
   process.exit(1);
 }
 
-if (!opts.in && !opts.dir) fail('Specify one input source: --in <path> or --dir <path>');
-if (opts.in && opts.dir) fail('Use only one input source: --in or --dir');
+const inputSources = [opts.in ? 1 : 0, opts.dir ? 1 : 0, opts.list ? 1 : 0, opts.listJsonl ? 1 : 0].reduce((a, b) => a + b, 0);
+if (inputSources === 0) fail('Specify one input source: --in, --dir, --list, or --list-jsonl');
+if (inputSources > 1) fail('Use only one input source: --in, --dir, --list, or --list-jsonl');
 if (!Number.isFinite(opts.views) || opts.views <= 0) fail('views must be a positive number');
 if (!Number.isFinite(opts.workers) || opts.workers <= 0) fail('workers must be a positive number');
 if (!Number.isFinite(opts.w) || opts.w <= 0) fail('Width must be a positive number');
 if (!Number.isFinite(opts.h) || opts.h <= 0) fail('Height must be a positive number');
 if (!['transparent', 'white'].includes(opts.bg)) fail('bg must be transparent or white');
+if (!['color', 'geometry', 'normal', 'wireframe'].includes(opts.material)) fail('material must be color, geometry, normal, or wireframe');
 if (!['local', 'cdn'].includes(opts.three)) fail('three must be local or cdn');
 if (!Number.isFinite(opts.exposure) || opts.exposure <= 0) fail('exposure must be positive');
 if (!Number.isFinite(opts.envIntensity) || opts.envIntensity <= 0) fail('env-intensity must be positive');
@@ -119,6 +125,7 @@ const renderOpts = {
   height: opts.h,
   bg: opts.bg,
   exposure: opts.exposure,
+  materialMode: opts.material,
   envUrl,
   envType,
   envIntensity: opts.envIntensity,
@@ -225,7 +232,13 @@ function collectGlbFiles(dir, recursive) {
 
 function safeBaseName(filePath) {
   const base = path.basename(filePath, path.extname(filePath));
-  return base.replace(/[^a-zA-Z0-9._-]/g, '_') || 'model';
+  // Preserve unicode letters/numbers while removing path separators and control chars.
+  const cleaned = base
+    .replace(/[\\\/]/g, '_')
+    .replace(/[\u0000-\u001f\u007f]/g, '_')
+    .replace(/[<>:"|?*]/g, '_')
+    .trim();
+  return cleaned || 'model';
 }
 
 function makeUniqueDirName(baseName, usedNames) {
@@ -313,6 +326,44 @@ function resolveInputModels() {
     if (!fs.existsSync(inputPath)) fail(`Input not found: ${opts.in}`);
     if (!inputPath.toLowerCase().endsWith('.glb')) fail('Input must be a .glb file');
     return [inputPath];
+  }
+
+  if (opts.list) {
+    const listPath = path.resolve(process.cwd(), opts.list);
+    if (!fs.existsSync(listPath)) fail(`List not found: ${opts.list}`);
+    const lines = fs.readFileSync(listPath, 'utf8')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) fail(`No entries found in list: ${opts.list}`);
+    const resolved = lines.map((p) => path.resolve(process.cwd(), p));
+    return Array.from(new Set(resolved)).sort();
+  }
+
+  if (opts.listJsonl) {
+    const listPath = path.resolve(process.cwd(), opts.listJsonl);
+    if (!fs.existsSync(listPath)) fail(`List JSONL not found: ${opts.listJsonl}`);
+    const key = (opts.listKey || '').trim();
+    const paths = [];
+    const lines = fs.readFileSync(listPath, 'utf8').split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const row = JSON.parse(trimmed);
+        let val = null;
+        if (key && row && Object.prototype.hasOwnProperty.call(row, key)) {
+          val = row[key];
+        } else if (row && typeof row === 'object') {
+          val = row.glb_path || row.path || null;
+        }
+        if (typeof val === 'string' && val.trim()) {
+          paths.push(path.resolve(process.cwd(), val.trim()));
+        }
+      } catch {}
+    }
+    if (paths.length === 0) fail(`No valid paths found in JSONL: ${opts.listJsonl}`);
+    return Array.from(new Set(paths)).sort();
   }
 
   const inputDirs = Array.isArray(opts.dir) ? opts.dir : [opts.dir];
@@ -813,11 +864,16 @@ async function run() {
   }
 
   const usedNames = new Map();
+  const mapLogPath = path.join(outRoot, 'render_map.tsv');
   const modelJobsAll = modelPaths.map((modelPath) => {
     const uniqueName = makeUniqueDirName(safeBaseName(modelPath), usedNames);
+    const outputDir = path.join(outRoot, uniqueName);
+    try {
+      fs.appendFileSync(mapLogPath, `${outputDir}\t${modelPath}\n`, { encoding: 'utf8' });
+    } catch {}
     return {
       modelPath,
-      outputDir: path.join(outRoot, uniqueName)
+      outputDir
     };
   });
 

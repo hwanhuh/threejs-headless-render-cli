@@ -51,6 +51,9 @@ node bin/render-glb.js --dir ./dataset/models
 Options:
 - `--in <path>` single GLB input
 - `--dir <path>` directory input (batch mode)
+- `--list <path>` text file with one GLB path per line
+- `--list-jsonl <path>` JSONL file containing GLB paths
+- `--list-key <key>` JSONL key to read from (default: `path` or `glb_path`)
 - `--out-dir <path>` output root directory, default `renders`
 - `--views <number>` number of views per model, default `24`
 - `--workers <number>` parallel renderer workers, default `min(8, cpu_cores/2)`
@@ -58,6 +61,7 @@ Options:
 - `--w <number>` default `1024`
 - `--h <number>` default `1024`
 - `--bg <transparent|white>` default `transparent`
+- `--material <color|geometry|normal|wireframe>` material override, default `color`
 - `--exposure <number>` default `1.35`
 - `--env <path>` optional environment map (.hdr or .exr) for lighting only
 - `--env-intensity <number>` default `1`
@@ -85,6 +89,8 @@ node bin/render-glb.js --dir ./dataset/models --out-dir ./renders --views 24 --s
 node bin/render-glb.js --dir /data/HHHH/texverse/extracted --out-dir ./renders --views 24 --workers 8 --gpu-mode gpu --profile --seed 42
 node bin/render-glb.js --in ./model.glb --bg white --three cdn --fov 40 --fov-jitter 3
 node bin/render-glb.js --in ./model.glb --env ./studio.hdr --env-intensity 1.0
+node bin/render-glb.js --list ./glbs.txt --out-dir ./renders --views 24
+node bin/render-glb.js --list-jsonl ./transparent_renders.jsonl --list-key glb_path --out-dir ./renders --material geometry
 ```
 
 H100 server example (all texverse parts under one root):
